@@ -410,19 +410,83 @@ const game = {
   showVerdict() {
     const acc = this.accuracy;
     const grade =
-      acc >= 99.5 ? ['PERFECT', 'var(--good)'] :
-      acc >= 97   ? ['EXCELLENT', 'var(--good)'] :
-      acc >= 92   ? ['GOOD', 'var(--accent)'] :
-      acc >= 80   ? ['ROUGH', 'var(--accent)'] :
-                    ['BUTCHERED', 'var(--bad)'];
+      acc >= 99.5 ? ['PERFECT', 'var(--good)', 3] :
+      acc >= 97   ? ['EXCELLENT', 'var(--good)', 2] :
+      acc >= 92   ? ['GOOD', 'var(--accent)', 1] :
+      acc >= 80   ? ['ROUGH', 'var(--accent)', 0] :
+                    ['BUTCHERED', 'var(--bad)', 0];
     verdictEl.querySelector('.grade').textContent = grade[0];
     verdictEl.querySelector('.grade').style.color = grade[1];
     verdictEl.querySelector('.pct').textContent =
       `${(this.halves[0].frac * 100).toFixed(1)} / ${(this.halves[1].frac * 100).toFixed(1)}`;
     verdictEl.classList.add('show');
+    if (grade[2]) celebrate(grade[2]);
     this.state = 'verdict';
   },
 };
+
+// ============================================================ celebration
+// tier 1 = GOOD sparkle, 2 = EXCELLENT burst, 3 = PERFECT golden blowout
+const confetti = [];
+const rings = [];
+const GOLD = ['#ffd700', '#ffe9a3', '#ff9f43', '#fff3c4', '#f5c542'];
+
+function celebrate(tier) {
+  const cy = game.shape.y;
+  const colors = tier === 3 ? GOLD : PALETTE;
+  const n = tier === 3 ? 180 : tier === 2 ? 90 : 36;
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = (tier === 3 ? 460 : tier === 2 ? 360 : 260) * (0.35 + Math.random() * 0.65);
+    confetti.push({
+      x: game.cutX + (Math.random() - 0.5) * 24,
+      y: cy + (Math.random() - 0.5) * 140,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 180,
+      rot: Math.random() * Math.PI * 2, vr: (Math.random() - 0.5) * 14,
+      w: 5 + Math.random() * 6, h: 3 + Math.random() * 5,
+      color: colors[(Math.random() * colors.length) | 0],
+      life: 0, ttl: 1.3 + Math.random() * (tier === 3 ? 1.3 : 0.7),
+    });
+  }
+  if (tier >= 2) rings.push({ x: game.cutX, y: cy, life: 0, ttl: tier === 3 ? 0.8 : 0.55,
+                              color: tier === 3 ? '255,215,0' : '111,227,165' });
+}
+
+function updateCelebration(dt) {
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const p = confetti[i];
+    p.life += dt;
+    if (p.life >= p.ttl) { confetti.splice(i, 1); continue; }
+    p.vy += 900 * dt;                       // gravity
+    p.vx *= (1 - 1.6 * dt);                 // air drag
+    p.vy *= (1 - 0.4 * dt);
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+    const fade = Math.min(1, (p.ttl - p.life) / (p.ttl * 0.3));
+    ctx.save();
+    ctx.globalAlpha = fade;
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    // flutter: squash width as it "tumbles"
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-p.w / 2 * Math.sin(p.life * 9 + p.rot), -p.h / 2,
+                 p.w * Math.sin(p.life * 9 + p.rot), p.h);
+    ctx.restore();
+  }
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    r.life += dt;
+    if (r.life >= r.ttl) { rings.splice(i, 1); continue; }
+    const t = r.life / r.ttl;
+    ctx.save();
+    ctx.strokeStyle = `rgba(${r.color},${(1 - t) * 0.9})`;
+    ctx.lineWidth = 4 * (1 - t) + 1;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, 20 + t * t * 520, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
 
 // ============================================================ render
 function drawShape(s) {
@@ -481,6 +545,8 @@ function frame(now) {
     for (const h of game.halves) drawHalf(game.shape, game.cutX, h.dir, eased * 46);
     if (game.state === 'cutting' && game.cutT >= 0.55) game.showVerdict();
   }
+
+  updateCelebration(dt);
 
   requestAnimationFrame(frame);
 }
