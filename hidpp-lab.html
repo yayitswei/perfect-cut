@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MX Dialpad HID++ Lab</title>
+<style>
+  :root { --bg:#0e0f12; --panel:#16181d; --line:#262a32; --fg:#e8e6e1;
+          --dim:#8a8f98; --accent:#ff9f43; --good:#6fe3a5; --bad:#ff6b6b; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html, body { overscroll-behavior:none; }
+  body { background:var(--bg); color:var(--fg); padding:20px;
+         font:13px/1.5 ui-monospace,"SF Mono",Menlo,monospace; }
+  h1 { font-size:17px; margin-bottom:2px; }
+  .sub { color:var(--dim); margin-bottom:14px; }
+  .row { display:flex; gap:14px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:13px; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin-bottom:8px; }
+  button { background:var(--accent); color:#1a1206; border:0; border-radius:8px;
+           padding:9px 14px; font:inherit; font-weight:700; cursor:pointer; margin:0 6px 6px 0; }
+  button.secondary { background:var(--line); color:var(--fg); }
+  button:disabled { opacity:.4; cursor:default; }
+  #features table { border-collapse:collapse; }
+  #features td { padding:1px 10px 1px 0; }
+  #features .known { color: var(--good); }
+  #log { flex:1; min-width:460px; }
+  #entries { height:430px; overflow-y:auto; font-size:12px; }
+  .e { padding:1px 4px; border-bottom:1px solid #1c1f25; white-space:pre-wrap; word-break:break-all; }
+  .e .tag { display:inline-block; min-width:46px; font-weight:700; }
+  .tag.EVT { color:var(--good); } .tag.TX { color:var(--accent); }
+  .tag.RX { color:#7ab8ff; } .tag.SYS { color:var(--dim); } .tag.ERR { color:var(--bad); }
+</style>
+</head>
+<body>
+<h1>MX Dialpad HID++ Lab</h1>
+<div class="sub">Raw device access over WebHID — no Options+ needed. Connect, then press buttons / turn the dial.</div>
+
+<div class="row">
+  <div class="panel" style="min-width:320px">
+    <h2>Device</h2>
+    <button id="connect">Connect (WebHID picker)</button>
+    <button id="enumerate" class="secondary" disabled>Enumerate features</button>
+    <button id="divert" class="secondary" disabled>Divert buttons + dial</button>
+    <button id="undivert" class="secondary" disabled>Un-divert</button>
+    <button id="clear" class="secondary">Clear log</button>
+    <div id="status" style="margin-top:8px; color:var(--dim); white-space:pre-wrap">—</div>
+    <div id="features" style="margin-top:10px"></div>
+  </div>
+  <div class="panel" id="log">
+    <h2>Protocol log (newest first)</h2>
+    <div id="entries"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const entries = document.getElementById('entries');
+const statusEl = document.getElementById('status');
+const featuresEl = document.getElementById('features');
+const hex = b => [...b].map(x => x.toString(16).padStart(2, '0')).join(' ');
+
+window.__hidppLog = [];
+function log(tag, msg) {
+  window.__hidppLog.push({ t: performance.now() | 0, tag, msg });
+  console.log(`[HIDPP][${tag}] ${msg}`);
+  const d = document.createElement('div');
+  d.className = 'e';
+  d.innerHTML = `<span class="tag ${tag}">${tag}</span>${msg}`;
+  entries.prepend(d);
+  if (entries.children.length > 500) entries.lastChild.remove();
+}
+
+// ------------------------------------------------------------------ HID++ core
+// HID++ 2.0: messages are [reportId, deviceIdx, featureIdx, funcId<<4|swId, ...args]
+// short report 0x10 (6 data bytes), long report 0x11 (19 data bytes).
+// BLE-direct devices typically use device index 0xFF and long reports only.
+const SW_ID = 0x0a;
+const KNOWN_FEATURES = {
+  0x0000:'IRoot', 0x0001:'IFeatureSet', 0x0003:'DeviceInfo', 0x0005:'DeviceName',
+  0x0007:'DeviceFriendlyName', 0x0020:'ConfigChange', 0x1000:'BatteryStatus',
+  0x1004:'UnifiedBattery', 0x1802:'DeviceReset', 0x1861:'BatteryCalibration',
+  0x1b04:'ReprogControlsV4', 0x1b05:'FullKeyCustomization', 0x1bc0:'ReportHIDUsages',
+  0x2110:'SmartShift', 0x2111:'SmartShiftEnhanced', 0x2121:'HiResWheel', 0x2130:'RatchetWheel',
+  0x2150:'Thumbwheel', 0x2201:'AdjustableDPI', 0x2250:'AnalogGenericSetting',
+  0x40a3:'FnInversion', 0x4531:'MultiPlatform', 0x4540:'KeyboardLayout2',
+  0x6501:'Gestures', 0x8010:'GKey', 0x8020:'MKeys', 0x8030:'MacroRecord',
+  0x8040:'BrightnessControl', 0x8060:'ReportRate', 0x8061:'ExtendedAdjustableReportRate',
+  0x8070:'ColorLEDEffects', 0x8071:'RGBEffects', 0x8090:'ModeStatus',
+  0x8100:'OnboardProfiles', 0x8110:'MouseButtonSpy', 0x9001:'PMW3816andPMW3826',
+  0x9205:'MLX903xx', 0x9300:'EPMforTHC2', 0x92e2:'TestKeysDisplay', 0x9302:'THC2',
+};
+
+let device = null;            // HIDDevice
+let longReportId = null;      // discovered from collections
+let deviceIdx = 0xff;
+let pending = [];             // waiting responses: {featIdx, funcSw, resolve, reject, timer}
+let featureTable = [];        // [{idx, id, name}]
+let cidTable = [];            // 1b04 control ids
+
+function findHidppCollection(dev) {
+  // vendor-defined usage pages: 0xFF43 (Logitech HID++), 0xFF00
+  for (const c of dev.collections) {
+    if (c.usagePage >= 0xff00) {
+      for (const r of (c.outputReports || [])) {
+        // long report = 19 data bytes + report id
+        const bits = (r.items || []).reduce((n, it) => n + (it.reportSize * it.reportCount), 0);
+        log('SYS', `vendor collection page=0x${c.usagePage.toString(16)} outRid=${r.reportId} bits=${bits}`);
+        if (bits >= 19 * 8) return { rid: r.reportId };
+      }
+    }
+  }
+  return null;
+}
+
+function onReport(e) {
+  const data = new Uint8Array(e.data.buffer);
+  if (longReportId !== null && e.reportId !== longReportId && e.reportId !== 0x10) {
+    log('RX', `rid=${e.reportId} (non-HID++) ${hex(data)}`);
+    return;
+  }
+  const [devIdx, featIdx, funcSw] = data;
+  // response to our call?
+  const pi = pending.findIndex(p => (featIdx === 0x8f ? true : (p.featIdx === featIdx && p.funcSw === funcSw)));
+  if (featIdx === 0x8f) { // HID++ error
+    const p = pending.length ? pending.splice(0, 1)[0] : null;
+    log('ERR', `HID++ error feat=${data[2]} func=0x${data[3]?.toString(16)} code=${data[4]} (${hex(data)})`);
+    if (p) { clearTimeout(p.timer); p.reject(new Error('hidpp error ' + data[4])); }
+    return;
+  }
+  if (pi >= 0 && (funcSw & 0x0f) === SW_ID) {
+    const p = pending.splice(pi, 1)[0];
+    clearTimeout(p.timer);
+    log('RX', `feat[${featIdx}] fn=${funcSw >> 4} ← ${hex(data.slice(3))}`);
+    p.resolve(data.slice(3));
+    return;
+  }
+  // unsolicited = EVENT (this is the good stuff: diverted buttons / dial)
+  const f = featureTable.find(f => f.idx === featIdx);
+  log('EVT', `feat[${featIdx}]${f ? ' ' + f.name : ''} fn=${funcSw >> 4} ${hex(data.slice(3))}`);
+  decodeEvent(f, funcSw >> 4, data.slice(3));
+}
+
+function call(featIdx, func, args = []) {
+  return new Promise((resolve, reject) => {
+    const payload = new Uint8Array(19);
+    payload[0] = deviceIdx; payload[1] = featIdx; payload[2] = (func << 4) | SW_ID;
+    args.forEach((b, i) => payload[3 + i] = b);
+    const p = { featIdx, funcSw: (func << 4) | SW_ID, resolve, reject,
+                timer: setTimeout(() => { pending = pending.filter(x => x !== p); reject(new Error('timeout')); }, 2500) };
+    pending.push(p);
+    log('TX', `feat[${featIdx}] fn=${func} → ${hex(args)}`);
+    device.sendReport(longReportId, payload).catch(err => {
+      clearTimeout(p.timer); pending = pending.filter(x => x !== p); reject(err);
+    });
+  });
+}
+
+// ------------------------------------------------------------------ discovery
+async function getFeatureIndex(featureId) {
+  const r = await call(0, 0, [featureId >> 8, featureId & 0xff]);   // IRoot.getFeature
+  return r[0];                                                       // 0 = not present
+}
+
+async function enumerateFeatures() {
+  featureTable = [{ idx: 0, id: 0, name: 'IRoot' }];
+  const ifsIdx = await getFeatureIndex(0x0001);
+  if (!ifsIdx) { log('ERR', 'IFeatureSet not found'); return; }
+  const count = (await call(ifsIdx, 0))[0];                          // IFeatureSet.getCount
+  log('SYS', `device reports ${count} features`);
+  for (let i = 1; i <= count; i++) {
+    const r = await call(ifsIdx, 1, [i]);                           // getFeatureId
+    const id = (r[0] << 8) | r[1];
+    featureTable.push({ idx: i, id, name: KNOWN_FEATURES[id] || '?' });
+  }
+  featuresEl.innerHTML = '<table>' + featureTable.map(f =>
+    `<tr><td>[${f.idx}]</td><td>0x${f.id.toString(16).padStart(4, '0')}</td>` +
+    `<td class="${f.name !== '?' ? 'known' : ''}">${f.name}</td></tr>`).join('') + '</table>';
+  document.getElementById('divert').disabled = false;
+  document.getElementById('undivert').disabled = false;
+
+  // friendly name, for confidence
+  const dnIdx = featureTable.find(f => f.id === 0x0005)?.idx;
+  if (dnIdx) {
+    const len = (await call(dnIdx, 0))[0];
+    let name = '';
+    while (name.length < len) {
+      const chunk = await call(dnIdx, 1, [name.length]);
+      name += String.fromCharCode(...chunk.filter(b => b > 0));
+    }
+    log('SYS', `device name: ${name}`);
+  }
+}
+
+// ------------------------------------------------------------------ divert
+async function setDivert(on) {
+  const flag = on ? 1 : 0;
+  // 0x1b04 ReprogControlsV4: divert every control id
+  const rcIdx = featureTable.find(f => f.id === 0x1b04)?.idx;
+  if (rcIdx) {
+    const count = (await call(rcIdx, 0))[0];                         // getCtrlIdCount
+    log('SYS', `1b04: ${count} controls`);
+    cidTable = [];
+    for (let i = 0; i < count; i++) {
+      const r = await call(rcIdx, 1, [i]);                           // getCtrlIdInfo
+      const cid = (r[0] << 8) | r[1], task = (r[2] << 8) | r[3], flags = r[4];
+      cidTable.push({ cid, task, flags });
+      log('SYS', `  control cid=0x${cid.toString(16)} task=0x${task.toString(16)} flags=0x${flags.toString(16)}`);
+    }
+    for (const c of cidTable) {
+      // setCtrlIdReporting: cid, flags (bit0 divert valid? layout: [cidH,cidL, flags, remapH,remapL])
+      // flags: bit0=divert, bit1=dvalid, bit4=persist... use divert|dvalid = 0x03
+      await call(rcIdx, 3, [c.cid >> 8, c.cid & 0xff, on ? 0x03 : 0x02, 0, 0])
+        .then(() => log('SYS', `  divert ${on ? 'ON' : 'off'} cid=0x${c.cid.toString(16)}`))
+        .catch(err => log('ERR', `  divert cid=0x${c.cid.toString(16)}: ${err.message}`));
+    }
+  } else log('SYS', 'no 0x1b04 ReprogControlsV4 on this device');
+
+  // 0x2121 HiResWheel: divert wheel + hi-res
+  const hwIdx = featureTable.find(f => f.id === 0x2121)?.idx;
+  if (hwIdx) {
+    const cap = await call(hwIdx, 0);                                // getWheelCapability
+    log('SYS', `2121 caps: multiplier=${cap[0]} flags=0x${cap[1]?.toString(16)}`);
+    // setWheelMode: bit0=invert? bit1=hires, bit2=divert  (solaar: target(bit0) res(bit1) inv(bit2)) — probe both
+    await call(hwIdx, 2, [flag ? 0x03 : 0x00])                      // divert+hires
+      .then(r => log('SYS', `2121 setMode → ${hex(r)}`))
+      .catch(err => log('ERR', `2121 setMode: ${err.message}`));
+  } else log('SYS', 'no 0x2121 HiResWheel on this device');
+
+  // 0x2150 Thumbwheel: setReporting(divert)
+  const twIdx = featureTable.find(f => f.id === 0x2150)?.idx;
+  if (twIdx) {
+    const info = await call(twIdx, 0).catch(() => null);             // getThumbwheelInfo
+    if (info) log('SYS', `2150 info: ${hex(info)}`);
+    await call(twIdx, 2, [flag])                                     // setThumbwheelReporting(divert)
+      .then(() => log('SYS', `2150 divert ${on ? 'ON' : 'off'}`))
+      .catch(err => log('ERR', `2150 setReporting: ${err.message}`));
+  } else log('SYS', 'no 0x2150 Thumbwheel on this device');
+}
+
+// ------------------------------------------------------------------ event decoding
+function decodeEvent(f, fn, d) {
+  if (!f) return;
+  if (f.id === 0x1b04 && fn === 0) {
+    const cids = [];
+    for (let i = 0; i < 8; i += 2) { const c = (d[i] << 8) | d[i + 1]; if (c) cids.push('0x' + c.toString(16)); }
+    log('SYS', `>>> BUTTONS DOWN: [${cids.join(', ') || 'released'}]`);
+  }
+  if (f.id === 0x2121 && fn === 0) {
+    const delta = (d[1] << 8 | d[2]) << 16 >> 16;
+    log('SYS', `>>> WHEEL delta=${delta} hires=${!!(d[0] & 0x10)} periods=${d[0] & 0x0f}`);
+  }
+  if (f.id === 0x2150 && fn === 0) {
+    const rot = (d[0] << 8 | d[1]) << 16 >> 16;
+    log('SYS', `>>> THUMBWHEEL rot=${rot} flags=${hex(d.slice(2, 5))}`);
+  }
+}
+
+// ------------------------------------------------------------------ UI
+document.getElementById('connect').addEventListener('click', async () => {
+  try {
+    const devs = await navigator.hid.requestDevice({ filters: [{ vendorId: 0x046d }] });
+    if (!devs.length) { log('SYS', 'picker: nothing chosen'); return; }
+    device = devs.find(d => findHidppCollectionQuiet(d)) || devs[0];
+    if (!device.opened) await device.open();
+    log('SYS', `opened "${device.productName}" pid=0x${device.productId.toString(16)}`);
+    device.collections.forEach((c, i) =>
+      log('SYS', `  col[${i}] page=0x${c.usagePage.toString(16)} usage=0x${c.usage.toString(16)}`
+        + ` in[${(c.inputReports || []).map(r => r.reportId)}] out[${(c.outputReports || []).map(r => r.reportId)}]`));
+    const col = findHidppCollection(device);
+    if (!col) { log('ERR', 'no vendor (HID++) output collection found — cannot send commands'); return; }
+    longReportId = col.rid;
+    log('SYS', `using long report id ${longReportId}, device index 0x${deviceIdx.toString(16)}`);
+    device.addEventListener('inputreport', onReport);
+    statusEl.textContent = `${device.productName} — connected, HID++ rid=${longReportId}`;
+    document.getElementById('enumerate').disabled = false;
+    // BLE-direct sometimes wants deviceIdx 0x00 instead of 0xff — probe
+    try { await call(0, 0, [0x00, 0x01]); }
+    catch (e1) {
+      log('SYS', 'deviceIdx 0xff failed, trying 0x00');
+      deviceIdx = 0x00;
+      try { await call(0, 0, [0x00, 0x01]); } catch (e2) { log('ERR', 'ping failed on both device indexes'); }
+    }
+    log('SYS', 'ping OK — HID++ channel is live');
+  } catch (err) { log('ERR', err.message); }
+});
+function findHidppCollectionQuiet(dev) {
+  return dev.collections.some(c => c.usagePage >= 0xff00 && (c.outputReports || []).length);
+}
+
+document.getElementById('enumerate').addEventListener('click', () =>
+  enumerateFeatures().catch(err => log('ERR', 'enumerate: ' + err.message)));
+document.getElementById('divert').addEventListener('click', () =>
+  setDivert(true).catch(err => log('ERR', 'divert: ' + err.message)));
+document.getElementById('undivert').addEventListener('click', () =>
+  setDivert(false).catch(err => log('ERR', 'undivert: ' + err.message)));
+document.getElementById('clear').addEventListener('click', () => { entries.innerHTML = ''; window.__hidppLog = []; });
+
+// auto-reopen previously granted devices
+(async () => {
+  if (!navigator.hid) { statusEl.textContent = 'WebHID not available'; return; }
+  const devs = await navigator.hid.getDevices();
+  statusEl.textContent = `granted devices: ${devs.length ? devs.map(d => d.productName).join(', ') : 'none yet'}`;
+})();
+</script>
+</body>
+</html>

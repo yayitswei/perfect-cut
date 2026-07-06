@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perfect Cut</title>
+<style>
+  :root {
+    --bg: #101216; --fg: #ece9e2; --dim: #7d828c;
+    --accent: #ff9f43; --good: #6fe3a5; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+  body { background: var(--bg); color: var(--fg);
+         font: 15px/1.4 "Avenir Next", "Futura", system-ui, sans-serif; }
+  #stage { display: block; width: 100vw; height: 100vh; }
+
+  #hud { position: fixed; top: 16px; left: 0; right: 0; display: flex;
+         justify-content: center; gap: 32px; pointer-events: none;
+         font-variant-numeric: tabular-nums; }
+  #hud .item { text-align: center; }
+  #hud .label { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+  #hud .value { font-size: 22px; font-weight: 600; }
+
+  #subject { position: fixed; top: 76px; left: 0; right: 0; text-align: center;
+             color: var(--dim); font-size: 14px; letter-spacing: .06em; pointer-events: none; }
+
+  #controls { position: fixed; bottom: 16px; left: 0; right: 0;
+              display: flex; justify-content: center; align-items: center; gap: 14px; }
+  #controls .hint { color: var(--dim); font-size: 13px; }
+  button { background: #1d2027; color: var(--fg); border: 1px solid #2c313b;
+           border-radius: 999px; padding: 8px 18px; font: inherit; font-size: 13px;
+           cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  #swap b { color: var(--accent); font-weight: 600; }
+
+  #verdict { position: fixed; top: 38%; left: 0; right: 0; text-align: center;
+             pointer-events: none; opacity: 0; transition: opacity .25s ease;
+             text-shadow: 0 2px 24px rgba(0,0,0,.6); }
+  #verdict.show { opacity: 1; }
+  #verdict .grade { font-size: 56px; font-weight: 700; letter-spacing: .04em; }
+  #verdict .pct { font-size: 24px; color: var(--dim); margin-top: 4px; }
+  #verdict .cont { font-size: 13px; color: var(--dim); margin-top: 18px;
+                   letter-spacing: .12em; text-transform: uppercase; }
+
+  #tuning { position: fixed; bottom: 16px; left: 16px; color: var(--dim);
+            font-size: 12px; display: grid; grid-template-columns: auto auto auto; gap: 4px 8px;
+            align-items: center; }
+  #tuning input[type=range] { width: 110px; accent-color: var(--accent); }
+  #tuning .val { font-variant-numeric: tabular-nums; min-width: 34px; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div id="hud">
+  <div class="item"><div class="label">Round</div><div class="value" id="hudRound">1</div></div>
+  <div class="item"><div class="label">Last cut</div><div class="value" id="hudLast">—</div></div>
+  <div class="item"><div class="label">Best</div><div class="value" id="hudBest">—</div></div>
+</div>
+<div id="subject"></div>
+
+<div id="verdict"><div class="grade"></div><div class="pct"></div><div class="cont">press to continue</div></div>
+
+<div id="controls">
+  <span class="hint" id="mapHint"></span>
+  <button id="mode">🖱 mouse</button>
+  <button id="swap">⇄ swap</button>
+  <button id="fullscreen">⛶ fullscreen</button>
+  <span class="hint" id="cutHint">click or space to cut</span>
+</div>
+
+<div id="tuning">
+  <span>move</span><input type="range" id="moveSens" min="0.02" max="0.6" step="0.01"><span class="val" id="moveSensVal"></span>
+  <span>rotate</span><input type="range" id="rotSens" min="0.0001" max="0.002" step="0.0001"><span class="val" id="rotSensVal"></span>
+</div>
+<div id="lastInput" style="position:fixed; bottom:16px; right:16px; color:var(--dim); font-size:12px;">last input: —</div>
+
+<script>
+'use strict';
+// ============================================================ canvas
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ============================================================ input
+// Big dial arrives as wheel deltaX; small roller as wheel deltaY
+// (firmware-native behavior, no Logi software involved).
+const saved = JSON.parse(localStorage.getItem('perfect-cut.input') || '{}');
+const input = {
+  // 'dial' (MX console: two wheel axes) | 'mouse' (one wheel); prior saves predate
+  // the mode key and came from the dial setup
+  mode: saved.mode ?? ('bigIsMove' in saved ? 'dial' : 'mouse'),
+  bigIsMove: saved.bigIsMove ?? true,   // dial mode: big dial = move, roller = rotate
+  mouseChannel: saved.mouseChannel ?? 'move',   // mouse mode: what the wheel drives now
+  moveSens: saved.moveSens ?? 0.18,     // px of shape travel per wheel px
+  rotSens: saved.rotSens ?? 0.0005,     // radians per wheel px
+  move: 0, rot: 0,                      // accumulated, drained each frame
+};
+function saveInput() {
+  localStorage.setItem('perfect-cut.input', JSON.stringify(
+    { mode: input.mode, bigIsMove: input.bigIsMove, mouseChannel: input.mouseChannel,
+      moveSens: input.moveSens, rotSens: input.rotSens }));
+}
+window.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (input.mode === 'dial') {
+    const big = e.deltaX, small = e.deltaY;
+    input.move += (input.bigIsMove ? big : small) * input.moveSens;
+    input.rot  += (input.bigIsMove ? small : big) * input.rotSens;
+  } else {
+    const d = e.deltaY + e.deltaX;      // one wheel, one channel at a time
+    if (input.mouseChannel === 'move') input.move += d * input.moveSens;
+    else input.rot += d * input.rotSens;
+  }
+}, { passive: false });
+
+function press(e) {
+  if (e && (e.metaKey || e.ctrlKey || e.altKey)) return;   // leave shortcuts alone
+  if (e && e.preventDefault) e.preventDefault();
+  game.press();
+}
+const lastInputEl = document.getElementById('lastInput');
+function noteInput(desc) { lastInputEl.textContent = 'last input: ' + desc; }
+
+window.addEventListener('keydown', e => {
+  noteInput(`key ${e.code}${e.metaKey ? ' +meta' : ''}${e.ctrlKey ? ' +ctrl' : ''}${e.altKey ? ' +alt' : ''}`);
+  if (!e.repeat) press(e);
+});
+// aux mouse buttons (console buttons often arrive as mouse back/forward = 3/4)
+window.addEventListener('mousedown', e => {
+  noteInput(`mouse button ${e.button}`);
+  if (e.button >= 3) { e.preventDefault(); game.press(); }
+});
+window.addEventListener('mouseup', e => { if (e.button >= 3) e.preventDefault(); });
+window.addEventListener('auxclick', e => { if (e.button >= 3) e.preventDefault(); });
+canvas.addEventListener('pointerdown', e => { if (e.button === 0) press(e); });
+// right-click: in mouse mode, flip which channel the wheel drives
+window.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (input.mode === 'mouse') {
+    input.mouseChannel = input.mouseChannel === 'move' ? 'rotate' : 'move';
+    updateMapHint(); saveInput();
+  }
+});
+
+const mapHint = document.getElementById('mapHint');
+const swapBtn = document.getElementById('swap');
+const modeBtn = document.getElementById('mode');
+const cutHint = document.getElementById('cutHint');
+function updateMapHint() {
+  if (input.mode === 'dial') {
+    mapHint.innerHTML = input.bigIsMove
+      ? '<b>big dial</b> moves · <b>roller</b> rotates'
+      : '<b>big dial</b> rotates · <b>roller</b> moves';
+    swapBtn.textContent = '⇄ swap wheels';
+    cutHint.textContent = 'press any console button (or space) to cut';
+  } else {
+    mapHint.innerHTML = `wheel <b>${input.mouseChannel === 'move' ? 'moves' : 'rotates'}</b> · right-click to flip`;
+    swapBtn.textContent = input.mouseChannel === 'move' ? '⇄ wheel: move' : '⇄ wheel: rotate';
+    cutHint.textContent = 'click or space to cut';
+  }
+  modeBtn.textContent = input.mode === 'dial' ? '🎛 MX dial' : '🖱 mouse';
+}
+swapBtn.addEventListener('click', e => {
+  if (input.mode === 'dial') input.bigIsMove = !input.bigIsMove;
+  else input.mouseChannel = input.mouseChannel === 'move' ? 'rotate' : 'move';
+  updateMapHint(); saveInput();
+  e.currentTarget.blur(); e.stopPropagation();
+});
+modeBtn.addEventListener('click', e => {
+  input.mode = input.mode === 'dial' ? 'mouse' : 'dial';
+  updateMapHint(); saveInput();
+  e.currentTarget.blur(); e.stopPropagation();
+});
+updateMapHint();
+
+document.getElementById('fullscreen').addEventListener('click', e => {
+  document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  e.currentTarget.blur(); e.stopPropagation();
+});
+
+for (const key of ['moveSens', 'rotSens']) {
+  const el = document.getElementById(key), val = document.getElementById(key + 'Val');
+  const show = () => val.textContent = key === 'rotSens' ? (input[key] * 1000).toFixed(1) : input[key].toFixed(2);
+  el.value = input[key]; show();
+  el.addEventListener('input', () => { input[key] = parseFloat(el.value); show(); saveInput(); });
+  el.addEventListener('change', () => el.blur());
+}
+
+// ============================================================ shapes as alpha masks
+// Every shape — emoji silhouette or procedural blob — becomes a MASK px
+// square offscreen canvas. Rendering tints it; scoring counts alpha pixels
+// on each side of the cut line. Holes (bagels!) and multi-part shapes work
+// for free.
+const MASK = 320;
+
+const EMOJI = [
+  ['🥐', 'croissant'], ['🍌', 'banana'], ['🍗', 'drumstick'], ['🍕', 'pizza slice'],
+  ['🥯', 'bagel'], ['🍩', 'donut'], ['🥑', 'avocado'], ['🍐', 'pear'],
+  ['🥕', 'carrot'], ['🍄', 'mushroom'], ['🌵', 'cactus'], ['🌙', 'moon'],
+  ['🚀', 'rocket'], ['✈️', 'plane'], ['⚓', 'anchor'], ['🔑', 'key'],
+  ['🎸', 'guitar'], ['👟', 'sneaker'], ['🦴', 'bone'], ['🍾', 'champagne'],
+  ['🐟', 'fish'], ['🦆', 'duck'], ['🐋', 'whale'], ['🐘', 'elephant'],
+  ['🗽', 'liberty'], ['🏰', 'castle'], ['🌂', 'umbrella'], ['🪑', 'chair'],
+];
+
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+const maskCache = new Map();
+function emojiMask(char) {
+  if (maskCache.has(char)) return maskCache.get(char);
+  const c = document.createElement('canvas');
+  c.width = c.height = MASK;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  // pass 1: draw big, find the glyph's alpha bounding box
+  g.font = `${MASK * 0.7}px sans-serif`;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(char, MASK / 2, MASK / 2);
+  const d = g.getImageData(0, 0, MASK, MASK).data;
+  let x0 = MASK, y0 = MASK, x1 = 0, y1 = 0;
+  for (let y = 0; y < MASK; y++) for (let x = 0; x < MASK; x++)
+    if (d[(y * MASK + x) * 4 + 3] > 16) {
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+  // pass 2: redraw centered + scaled to fill the mask
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  const fit = MASK * 0.92 / Math.max(bw, bh);
+  const c2 = document.createElement('canvas');
+  c2.width = c2.height = MASK;
+  const g2 = c2.getContext('2d', { willReadFrequently: true });
+  g2.translate(MASK / 2, MASK / 2);
+  g2.scale(fit, fit);
+  g2.translate(-(x0 + bw / 2), -(y0 + bh / 2));
+  g2.drawImage(c, 0, 0);
+  const mask = { canvas: c2, alpha: g2.getImageData(0, 0, MASK, MASK).data };
+  maskCache.set(char, mask);
+  return mask;
+}
+
+function blobMask(rng, elongation) {
+  // smooth asymmetric blob via Catmull-Rom over random radii; optionally stretched
+  const n = 7 + Math.floor(rng() * 4);
+  const ctrl = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * Math.PI * 2, r = 0.5 + rng() * 0.5;
+    ctrl.push([Math.cos(a) * r, Math.sin(a) * r]);
+  }
+  const c = document.createElement('canvas');
+  c.width = c.height = MASK;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.translate(MASK / 2, MASK / 2);
+  g.scale(MASK * 0.46 * elongation, MASK * 0.46 / elongation);
+  g.beginPath();
+  const SEG = 14;
+  for (let i = 0; i < n; i++) {
+    const p0 = ctrl[(i - 1 + n) % n], p1 = ctrl[i], p2 = ctrl[(i + 1) % n], p3 = ctrl[(i + 2) % n];
+    for (let s = 0; s <= SEG; s++) {
+      const t = s / SEG, t2 = t * t, t3 = t2 * t;
+      const px = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      const py = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      (i === 0 && s === 0) ? g.moveTo(px, py) : g.lineTo(px, py);
+    }
+  }
+  g.closePath();
+  g.fillStyle = '#fff';
+  g.fill();
+  return { canvas: c, alpha: g.getImageData(0, 0, MASK, MASK).data };
+}
+
+// tinted version of a mask for drawing
+function tintMask(mask, color) {
+  const c = document.createElement('canvas');
+  c.width = c.height = MASK;
+  const g = c.getContext('2d');
+  g.drawImage(mask.canvas, 0, 0);
+  g.globalCompositeOperation = 'source-in';
+  g.fillStyle = color;
+  g.fillRect(0, 0, MASK, MASK);
+  return c;
+}
+
+// ============================================================ scoring
+// Count alpha-weighted mask pixels on each side of the screen-space vertical
+// line x = cutX, given the shape transform (x, y, rot, scale where scale is
+// screen px per mask px). Sub-pixel accurate via alpha weighting; holes and
+// disjoint parts handled naturally.
+function splitAreas(mask, sx, sy, rot, scale, cutX) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  let left = 0, right = 0;
+  const a = mask.alpha;
+  const half = MASK / 2;
+  for (let y = 0; y < MASK; y++) {
+    const my = y + 0.5 - half;
+    const rowBase = y * MASK;
+    // screenX = sx + scale * (mx*c - my*s); precompute the my part
+    const yTerm = sx - scale * my * s - cutX;
+    for (let x = 0; x < MASK; x++) {
+      const alpha = a[(rowBase + x) * 4 + 3];
+      if (!alpha) continue;
+      const mx = x + 0.5 - half;
+      (scale * mx * c + yTerm < 0) ? left += alpha : right += alpha;
+    }
+  }
+  return { left, right };
+}
+
+// ============================================================ game
+const hudRound = document.getElementById('hudRound');
+const hudLast = document.getElementById('hudLast');
+const hudBest = document.getElementById('hudBest');
+const subjectEl = document.getElementById('subject');
+const verdictEl = document.getElementById('verdict');
+
+const PALETTE = ['#e8b04b', '#7fc8a9', '#c98bdb', '#7ab8ff', '#ef8d75', '#a2d05f'];
+
+const game = {
+  state: 'aim',          // aim | cutting | verdict
+  round: 1, best: null,
+  shape: null,           // {mask, tinted, name, x, y, rot, scale}
+  halves: null,          // [{dir, frac}, ...] — drawn via clipped mask
+  cutX: 0, cutT: 0,
+  seed: (Math.random() * 1e9) | 0,
+  deck: [],              // shuffled shape queue, no repeats until exhausted
+
+  drawCard(rng) {
+    if (!this.deck.length) {
+      this.deck = EMOJI.map((e, i) => ({ type: 'emoji', i }));
+      this.deck.push({ type: 'blob' }, { type: 'blob' }, { type: 'blob-long' }, { type: 'blob-long' });
+      for (let i = this.deck.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [this.deck[i], this.deck[j]] = [this.deck[j], this.deck[i]];
+      }
+    }
+    return this.deck.pop();
+  },
+
+  newRound() {
+    const rng = mulberry32(this.seed + this.round * 7919);
+    const card = this.drawCard(rng);
+    let mask, name;
+    if (card.type === 'emoji') {
+      [/* char */, name] = EMOJI[card.i];
+      mask = emojiMask(EMOJI[card.i][0]);
+    } else {
+      name = card.type === 'blob-long' ? 'long blob' : 'blob';
+      mask = blobMask(rng, card.type === 'blob-long' ? 1.7 + rng() * 0.5 : 1);
+    }
+    const color = PALETTE[(this.round - 1) % PALETTE.length];
+    const size = Math.min(W, H) * (0.34 + rng() * 0.12);   // screen px across
+    this.shape = {
+      mask, name,
+      tinted: tintMask(mask, color),
+      scale: size / MASK,
+      x: W / 2 + (rng() - 0.5) * W * 0.45,
+      y: H / 2 + (rng() - 0.5) * H * 0.1,
+      rot: rng() * Math.PI * 2,
+    };
+    this.halves = null;
+    this.state = 'aim';
+    verdictEl.classList.remove('show');
+    hudRound.textContent = this.round;
+    subjectEl.textContent = `halve the ${name}`;
+  },
+
+  press() {
+    if (this.state === 'aim') this.cut();
+    else if (this.state === 'verdict') { this.round++; this.newRound(); }
+  },
+
+  cut() {
+    const s = this.shape;
+    this.cutX = W / 2;
+    const { left, right } = splitAreas(s.mask, s.x, s.y, s.rot, s.scale, this.cutX);
+    const total = left + right;
+    if (total < 1) return;                          // nothing under the knife
+    const acc = 200 * Math.min(left, right) / total;
+    this.halves = [
+      { dir: -1, frac: left / total },
+      { dir: 1, frac: right / total },
+    ];
+    this.accuracy = acc;
+    this.cutT = 0;
+    this.state = 'cutting';
+
+    const accStr = acc.toFixed(1) + '%';
+    hudLast.textContent = accStr;
+    if (this.best === null || acc > this.best) {
+      this.best = acc;
+      hudBest.textContent = accStr;
+    }
+  },
+
+  showVerdict() {
+    const acc = this.accuracy;
+    const grade =
+      acc >= 99.5 ? ['PERFECT', 'var(--good)'] :
+      acc >= 97   ? ['EXCELLENT', 'var(--good)'] :
+      acc >= 92   ? ['GOOD', 'var(--accent)'] :
+      acc >= 80   ? ['ROUGH', 'var(--accent)'] :
+                    ['BUTCHERED', 'var(--bad)'];
+    verdictEl.querySelector('.grade').textContent = grade[0];
+    verdictEl.querySelector('.grade').style.color = grade[1];
+    verdictEl.querySelector('.pct').textContent =
+      `${(this.halves[0].frac * 100).toFixed(1)} / ${(this.halves[1].frac * 100).toFixed(1)}`;
+    verdictEl.classList.add('show');
+    this.state = 'verdict';
+  },
+};
+
+// ============================================================ render
+function drawShape(s) {
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(s.rot);
+  ctx.scale(s.scale, s.scale);
+  ctx.drawImage(s.tinted, -MASK / 2, -MASK / 2);
+  ctx.restore();
+}
+
+// one half = shape clipped to its side of the cut, slid apart horizontally
+function drawHalf(s, cutX, dir, offset) {
+  ctx.save();
+  ctx.translate(dir * offset, 0);
+  ctx.beginPath();
+  if (dir < 0) ctx.rect(-W, -H, W + cutX, H * 3);
+  else ctx.rect(cutX, -H, W * 2, H * 3);
+  ctx.clip();
+  drawShape(s);
+  ctx.restore();
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (game.state === 'aim') {
+    const s = game.shape;
+    s.x = Math.max(60, Math.min(W - 60, s.x + input.move));
+    s.rot += input.rot;
+  }
+  input.move = 0; input.rot = 0;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // cut line — vertical dotted, center
+  ctx.save();
+  ctx.strokeStyle = game.state === 'aim' ? 'rgba(255,159,67,.85)' : 'rgba(125,130,140,.35)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([2, 10]);
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 40);
+  ctx.lineTo(W / 2, H - 60);
+  ctx.stroke();
+  ctx.restore();
+
+  if (game.state === 'aim') {
+    drawShape(game.shape);
+  } else if (game.halves) {
+    game.cutT += dt;
+    const sep = Math.min(1, game.cutT / 0.5);
+    const eased = 1 - Math.pow(1 - sep, 3);
+    for (const h of game.halves) drawHalf(game.shape, game.cutX, h.dir, eased * 46);
+    if (game.state === 'cutting' && game.cutT >= 0.55) game.showVerdict();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+game.newRound();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

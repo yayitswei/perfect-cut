@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MX Dial Input Lab</title>
+<style>
+  :root {
+    --bg: #0e0f12; --panel: #16181d; --line: #262a32;
+    --fg: #e8e6e1; --dim: #8a8f98; --accent: #ff9f43; --good: #6fe3a5; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { overscroll-behavior: none; }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.5 ui-monospace, "SF Mono", Menlo, monospace; padding: 20px; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .sub { color: var(--dim); margin-bottom: 16px; }
+  .row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin-bottom: 10px; }
+  #needleWrap { width: 220px; text-align: center; }
+  svg { display: block; margin: 0 auto; }
+  #needle { transform-origin: 100px 100px; transition: transform 40ms linear; }
+  #dialValue { font-size: 28px; color: var(--accent); margin-top: 6px; }
+  button { background: var(--accent); color: #1a1206; border: 0; border-radius: 8px;
+           padding: 10px 16px; font: inherit; font-weight: 700; cursor: pointer; }
+  button.secondary { background: var(--line); color: var(--fg); }
+  button + button { margin-left: 8px; }
+  #status { margin: 10px 0; color: var(--dim); white-space: pre-wrap; }
+  #log { flex: 1; min-width: 480px; max-width: 900px; }
+  #entries { height: 420px; overflow-y: auto; font-size: 12px; }
+  .e { padding: 1px 4px; border-bottom: 1px solid #1c1f25; white-space: pre-wrap; word-break: break-all; }
+  .e .tag { display: inline-block; min-width: 52px; font-weight: 700; }
+  .tag.HID { color: var(--good); } .tag.WHEEL { color: var(--accent); }
+  .tag.KEY { color: #7ab8ff; } .tag.SYS { color: var(--dim); } .tag.BTN { color: #d78cff; }
+  .chg { background: #4a3413; color: #ffd27a; border-radius: 3px; }
+  .counts { color: var(--dim); margin-top: 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>MX Dial Input Lab</h1>
+<div class="sub">Turn / press the dial and roller with this tab focused. Everything the browser can see gets logged.</div>
+
+<div class="row">
+  <div class="panel" id="needleWrap">
+    <h2>Live dial</h2>
+    <svg width="200" height="200" viewBox="0 0 200 200">
+      <circle cx="100" cy="100" r="88" fill="none" stroke="#262a32" stroke-width="10"/>
+      <g id="ticks"></g>
+      <line id="needle" x1="100" y1="100" x2="100" y2="26" stroke="#ff9f43" stroke-width="5" stroke-linecap="round"/>
+      <circle cx="100" cy="100" r="10" fill="#ff9f43"/>
+    </svg>
+    <div id="dialValue">0</div>
+    <div class="counts" id="counts">hid 0 · wheel 0 · key 0</div>
+  </div>
+
+  <div class="panel" style="min-width:300px">
+    <h2>WebHID</h2>
+    <button id="connect">Connect dial (WebHID)</button>
+    <button id="clear" class="secondary">Clear log</button>
+    <button id="copy" class="secondary">Copy log</button>
+    <div id="status">checking…</div>
+  </div>
+
+  <div class="panel" id="log">
+    <h2>Event log (newest first)</h2>
+    <div id="entries"></div>
+  </div>
+</div>
+
+<script>
+const entries = document.getElementById('entries');
+const statusEl = document.getElementById('status');
+const needle = document.getElementById('needle');
+const dialValueEl = document.getElementById('dialValue');
+const countsEl = document.getElementById('counts');
+const counts = { hid: 0, wheel: 0, key: 0 };
+let dialValue = 0;
+
+// tick marks
+{ const g = document.getElementById('ticks');
+  for (let i = 0; i < 24; i++) {
+    const a = i * Math.PI * 2 / 24;
+    const t = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    t.setAttribute('x1', 100 + Math.sin(a) * 80); t.setAttribute('y1', 100 - Math.cos(a) * 80);
+    t.setAttribute('x2', 100 + Math.sin(a) * 88); t.setAttribute('y2', 100 - Math.cos(a) * 88);
+    t.setAttribute('stroke', '#3a3f49'); t.setAttribute('stroke-width', '2');
+    g.appendChild(t);
+  } }
+
+window.__labEvents = [];   // machine-readable ring buffer for automation
+function record(tag, msg, extra) {
+  window.__labEvents.push({ t: performance.now() | 0, tag, msg, ...extra });
+  if (window.__labEvents.length > 3000) window.__labEvents.splice(0, 1000);
+  console.log(`[LAB][${tag}] ${msg}`);
+  const d = document.createElement('div');
+  d.className = 'e';
+  d.innerHTML = `<span class="tag ${tag}">${tag}</span>${msg}`;
+  entries.prepend(d);
+  if (entries.children.length > 400) entries.lastChild.remove();
+  countsEl.textContent = `hid ${counts.hid} · wheel ${counts.wheel} · key ${counts.key}`;
+}
+function bump(delta) {
+  dialValue += delta;
+  dialValueEl.textContent = dialValue;
+  needle.style.transform = `rotate(${dialValue * 6}deg)`;
+}
+
+// ---------- wheel ----------
+window.addEventListener('wheel', e => {
+  counts.wheel++;
+  record('WHEEL', `dX=${e.deltaX} dY=${e.deltaY} mode=${e.deltaMode} ctrl=${e.ctrlKey}`);
+  bump(e.deltaY !== 0 ? Math.sign(e.deltaY) : Math.sign(e.deltaX));
+  e.preventDefault();
+}, { passive: false });
+
+// ---------- keyboard ----------
+window.addEventListener('keydown', e => {
+  counts.key++;
+  record('KEY', `down code=${e.code} key=${JSON.stringify(e.key)} repeat=${e.repeat} meta=${e.metaKey} ctrl=${e.ctrlKey} alt=${e.altKey} shift=${e.shiftKey}`);
+});
+window.addEventListener('keyup', e => record('KEY', `up   code=${e.code}`));
+
+// ---------- mouse buttons (aux) ----------
+window.addEventListener('mousedown', e => record('BTN', `mousedown button=${e.button}`));
+
+// ---------- WebHID ----------
+const lastBytes = new Map();   // per device+reportId
+
+function hexDiff(key, data) {
+  const bytes = [...new Uint8Array(data.buffer)];
+  const prev = lastBytes.get(key);
+  lastBytes.set(key, bytes);
+  return bytes.map((b, i) => {
+    const h = b.toString(16).padStart(2, '0');
+    return prev && prev[i] !== b ? `<span class="chg">${h}</span>` : h;
+  }).join(' ');
+}
+
+function describeCollections(device) {
+  const parts = [];
+  for (const c of device.collections) {
+    const rids = ids => [...new Set(ids.map(r => r.reportId))].join(',');
+    parts.push(`page=0x${c.usagePage.toString(16)} usage=0x${c.usage.toString(16)}`
+      + ` in[${rids(c.inputReports || [])}] out[${rids(c.outputReports || [])}] feat[${rids(c.featureReports || [])}]`);
+  }
+  return parts.join(' | ');
+}
+
+async function openDevice(device) {
+  if (!device.opened) {
+    try { await device.open(); }
+    catch (err) { record('SYS', `open FAILED ${device.productName}: ${err.message}`); return; }
+  }
+  record('SYS', `opened "${device.productName}" vid=0x${device.vendorId.toString(16)} pid=0x${device.productId.toString(16)}`);
+  record('SYS', `collections: ${describeCollections(device)}`);
+  device.addEventListener('inputreport', e => {
+    counts.hid++;
+    const key = `${e.device.productId}:${e.reportId}`;
+    const bytes = [...new Uint8Array(e.data.buffer)];
+    window.__labEvents.push({ t: performance.now() | 0, tag: 'HIDRAW', rid: e.reportId, bytes });
+    record('HID', `rid=${e.reportId} len=${e.data.byteLength} ${hexDiff(key, e.data)}`);
+    bump(0.5); // visual pulse so activity is obvious
+  });
+}
+
+async function refreshStatus() {
+  if (!navigator.hid) { statusEl.textContent = 'navigator.hid NOT available (need Chrome/Edge, secure context)'; return; }
+  const devs = await navigator.hid.getDevices();
+  statusEl.textContent = `WebHID available. Granted devices: ${devs.length}`
+    + devs.map(d => `\n  · ${d.productName} (0x${d.vendorId.toString(16)}/0x${d.productId.toString(16)}) ${d.opened ? 'open' : 'closed'}`).join('');
+  for (const d of devs) if (d.vendorId === 0x046d) await openDevice(d);
+}
+
+document.getElementById('connect').addEventListener('click', async () => {
+  if (!navigator.hid) return;
+  try {
+    const devs = await navigator.hid.requestDevice({ filters: [{ vendorId: 0x046d }] });
+    record('SYS', `requestDevice returned ${devs.length} device(s)`);
+    for (const d of devs) await openDevice(d);
+    refreshStatus();
+  } catch (err) { record('SYS', `requestDevice error: ${err.message}`); }
+});
+
+document.getElementById('clear').addEventListener('click', () => {
+  entries.innerHTML = ''; window.__labEvents = []; console.clear();
+});
+document.getElementById('copy').addEventListener('click', () => {
+  navigator.clipboard.writeText(window.__labEvents.map(e => JSON.stringify(e)).join('\n'));
+});
+
+if (navigator.hid) {
+  navigator.hid.addEventListener('connect', e => { record('SYS', `HID connect: ${e.device.productName}`); openDevice(e.device); });
+  navigator.hid.addEventListener('disconnect', e => record('SYS', `HID disconnect: ${e.device.productName}`));
+}
+refreshStatus();
+record('SYS', `lab ready. secureContext=${window.isSecureContext} ua=${navigator.userAgent.split(') ')[0]})`);
+</script>
+</body>
+</html>
